@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Simple IPTV Player</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    background: #0e0e10;
+    color: #f1f1f1;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 10px 16px;
+    background: #1a1a1d;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+  header input {
+    flex: 1;
+    min-width: 120px;
+    padding: 8px;
+    border-radius: 4px;
+    border: 1px solid #333;
+    background: #2a2a2e;
+    color: #fff;
+  }
+  header button {
+    padding: 8px 14px;
+    border: none;
+    border-radius: 4px;
+    background: #5865f2;
+    color: #fff;
+    cursor: pointer;
+    font-weight: bold;
+  }
+  header button:hover { background: #4752c4; }
+  .main {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+  }
+  .sidebar {
+    width: 280px;
+    background: #18181b;
+    overflow-y: auto;
+    border-right: 1px solid #2a2a2e;
+  }
+  .sidebar input[type="text"] {
+    width: 100%;
+    padding: 8px;
+    background: #2a2a2e;
+    border: none;
+    color: #fff;
+    border-bottom: 1px solid #333;
+  }
+  .channel {
+    padding: 10px 12px;
+    cursor: pointer;
+    border-bottom: 1px solid #222;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .channel:hover { background: #2a2a2e; }
+  .channel.active { background: #5865f2; }
+  .channel img {
+    width: 28px; height: 28px; object-fit: contain; flex-shrink: 0;
+  }
+  .player-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: #000;
+  }
+  video {
+    flex: 1;
+    width: 100%;
+    background: #000;
+  }
+  .status {
+    padding: 8px 16px;
+    font-size: 13px;
+    color: #aaa;
+    background: #1a1a1d;
+  }
+  .status.error { color: #ff6b6b; }
+  .category-header {
+    padding: 8px 12px;
+    font-size: 12px;
+    text-transform: uppercase;
+    color: #888;
+    background: #141416;
+    cursor: pointer;
+  }
+  @media (max-width: 700px) {
+    .main { flex-direction: column; }
+    .sidebar { width: 100%; height: 40vh; border-right: none; border-bottom: 1px solid #2a2a2e; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <input id="hostUrl" type="text" placeholder="Server URL e.g. http://3vilcorp.uk:8080">
+  <input id="username" type="text" placeholder="Username">
+  <input id="password" type="password" placeholder="Password">
+  <button id="loadBtn">Load Channels</button>
+</header>
+
+<div class="status" id="status">Enter credentials and click "Load Channels".</div>
+
+<div class="main">
+  <div class="sidebar" id="sidebar">
+    <input type="text" id="filterBox" placeholder="Filter channels..." />
+    <div id="channelList"></div>
+  </div>
+  <div class="player-area">
+    <video id="player" controls autoplay playsinline></video>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+<script>
+/*
+  ===========================================================================
+  CONFIG
+  ===========================================================================
+  CORS_PROXY:
+    Xtream Codes panels generally do NOT send CORS headers, so a browser
+    fetch() to the player_api.php endpoint will be blocked unless routed
+    through a proxy.
+
+    Default below uses a public proxy (allorigins.win) for quick testing.
+    For reliability/privacy, deploy your own tiny Cloudflare Worker proxy
+    (see the comment block at the bottom of this file for the worker code)
+    and replace CORS_PROXY with its URL, e.g.:
+        const CORS_PROXY = "https://your-worker.yourname.workers.dev/?url=";
+
+    Set CORS_PROXY = "" to call the API directly with no proxy (works only
+    if the provider sends CORS headers or you're running this app on the
+    same domain/server as the panel).
+  ===========================================================================
+*/
+const CORS_PROXY = "https://api.allorigins.win/raw?url=";
+
+let hls = null;
+const video = document.getElementById('player');
+const statusEl = document.getElementById('status');
+const channelListEl = document.getElementById('channelList');
+const filterBox = document.getElementById('filterBox');
+
+let allChannels = [];
+
+function setStatus(msg, isError) {
+  statusEl.textContent = msg;
+  statusEl.className = 'status' + (isError ? ' error' : '');
+}
+
+function proxied(url) {
+  return CORS_PROXY ? CORS_PROXY + encodeURIComponent(url) : url;
+}
+
+document.getElementById('loadBtn').addEventListener('click', loadChannels);
+
+async function loadChannels() {
+  const host = document.getElementById('hostUrl').value.trim().replace(/\/+$/, '');
+  const user = document.getElementById('username').value.trim();
+  const pass = document.getElementById('password').value.trim();
+
+  if (!host || !user || !pass) {
+    setStatus('Please fill in server URL, username and password.', true);
+    return;
+  }
+
+  // Save for next visit
+  localStorage.setItem('iptv_host', host);
+  localStorage.setItem('iptv_user', user);
+  localStorage.setItem('iptv_pass', pass);
+
+  setStatus('Loading channel list...');
+  channelListEl.innerHTML = '';
+  allChannels = [];
+
+  try {
+    // 1. Get live categories
+    const catUrl = `${host}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}&action=get_live_categories`;
+    const catRes = await fetch(proxied(catUrl));
+    if (!catRes.ok) throw new Error('Category request failed: ' + catRes.status);
+    const categories = await catRes.json();
+
+    // 2. Get all live streams
+    const streamUrl = `${host}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}&action=get_live_streams`;
+    const streamRes = await fetch(proxied(streamUrl));
+    if (!streamRes.ok) throw new Error('Stream request failed: ' + streamRes.status);
+    const streams = await streamRes.json();
+
+    if (!Array.isArray(streams) || streams.length === 0) {
+      setStatus('No channels returned. Check your credentials.', true);
+      return;
+    }
+
+    const catMap = {};
+    (categories || []).forEach(c => catMap[c.category_id] = c.category_name);
+
+    allChannels = streams.map(s => ({
+      id: s.stream_id,
+      name: s.name,
+      icon: s.stream_icon,
+      category: catMap[s.category_id] || 'Other',
+      url: `${host}/live/${encodeURIComponent(user)}/${encodeURIComponent(pass)}/${s.stream_id}.m3u8`
+    }));
+
+    renderChannels(allChannels);
+    setStatus(`Loaded ${allChannels.length} channels.`);
+  } catch (err) {
+    console.error(err);
+    setStatus('Error loading channels: ' + err.message + ' (CORS or proxy issue likely — see comments in source)', true);
+  }
+}
+
+function renderChannels(channels) {
+  channelListEl.innerHTML = '';
+
+  // Group by category
+  const grouped = {};
+  channels.forEach(ch => {
+    if (!grouped[ch.category]) grouped[ch.category] = [];
+    grouped[ch.category].push(ch);
+  });
+
+  Object.keys(grouped).sort().forEach(cat => {
+    const header = document.createElement('div');
+    header.className = 'category-header';
+    header.textContent = `${cat} (${grouped[cat].length})`;
+    channelListEl.appendChild(header);
+
+    grouped[cat].forEach(ch => {
+      const item = document.createElement('div');
+      item.className = 'channel';
+      item.dataset.url = ch.url;
+      item.dataset.name = ch.name;
+
+      if (ch.icon) {
+        const img = document.createElement('img');
+        img.src = ch.icon;
+        img.onerror = () => img.style.display = 'none';
+        item.appendChild(img);
+      }
+
+      const span = document.createElement('span');
+      span.textContent = ch.name;
+      item.appendChild(span);
+
+      item.addEventListener('click', () => playChannel(ch, item));
+      channelListEl.appendChild(item);
+    });
+  });
+}
+
+function playChannel(ch, el) {
+  document.querySelectorAll('.channel.active').forEach(e => e.classList.remove('active'));
+  if (el) el.classList.add('active');
+
+  setStatus('Playing: ' + ch.name);
+
+  const url = ch.url;
+
+  if (hls) {
+    hls.destroy();
+    hls = null;
+  }
+
+  if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Native HLS support (Safari, some smart TVs)
+    video.src = url;
+    video.play().catch(e => setStatus('Playback error: ' + e.message, true));
+  } else if (window.Hls && Hls.isSupported()) {
+    hls = new Hls();
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      if (data.fatal) setStatus('HLS error: ' + data.details, true);
+    });
+    video.play().catch(e => {});
+  } else {
+    setStatus('HLS not supported in this browser.', true);
+  }
+}
+
+filterBox.addEventListener('input', () => {
+  const term = filterBox.value.toLowerCase();
+  const filtered = allChannels.filter(ch => ch.name.toLowerCase().includes(term));
+  renderChannels(filtered);
+});
+
+// Restore saved credentials
+window.addEventListener('load', () => {
+  const host = localStorage.getItem('iptv_host');
+  const user = localStorage.getItem('iptv_user');
+  const pass = localStorage.getItem('iptv_pass');
+  if (host) document.getElementById('hostUrl').value = host;
+  if (user) document.getElementById('username').value = user;
+  if (pass) document.getElementById('password').value = pass;
+});
+</script>
+
+<!--
+===============================================================================
+OPTIONAL: Cloudflare Worker CORS proxy (free, recommended for reliability)
+===============================================================================
+1. Go to https://workers.cloudflare.com and create a free account.
+2. Create a new Worker, paste the code below, and deploy.
+3. Copy the worker URL (e.g. https://my-iptv-proxy.yourname.workers.dev)
+4. In this file, set:
+     const CORS_PROXY = "https://my-iptv-proxy.yourname.workers.dev/?url=";
+
+--- Worker code (paste into the Cloudflare dashboard editor) ---
+
+export default {
+  async fetch(request) {
+    const target = new URL(request.url).searchParams.get('url');
+    if (!target) return new Response('Missing url param', { status: 400 });
+
+    const resp = await fetch(target);
+    const body = await resp.arrayBuffer();
+
+    return new Response(body, {
+      status: resp.status,
+      headers: {
+        'Content-Type': resp.headers.get('Content-Type') || 'application/octet-stream',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+};
+
+===============================================================================
+-->
+</body>
+</html>
